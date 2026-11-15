@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -9,7 +8,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -63,12 +62,15 @@ dp = Dispatcher(storage=MemoryStorage())
 # =====================================
 
 class AddAnime(StatesGroup):
-    waiting_data = State()
+    code = State()
+    title = State()
+    photo = State()
+    description = State()
 
 
 class AddEpisode(StatesGroup):
-    waiting_data = State()
-    waiting_video = State()
+    waiting_code = State()
+    waiting_videos = State()
 
 
 class PublishAnime(StatesGroup):
@@ -77,6 +79,10 @@ class PublishAnime(StatesGroup):
 
 class SearchAnime(StatesGroup):
     waiting_code = State()
+
+
+# admin_id -> {"code": str, "start": int, "items": [(message_id, file_id, type)]}
+pending_episodes = {}
 
 
 # =====================================
@@ -128,6 +134,13 @@ async def init_db():
             )
         """)
 
+        try:
+            await db.execute(
+                "ALTER TABLE anime ADD COLUMN photo_id TEXT DEFAULT ''"
+            )
+        except aiosqlite.OperationalError:
+            pass  # ustun allaqachon bor
+
         await db.commit()
 
     log.info("Database tayyor: %s", DB_PATH)
@@ -137,7 +150,7 @@ async def get_anime(code):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            SELECT code, title, description
+            SELECT code, title, description, photo_id
             FROM anime
             WHERE UPPER(code) = UPPER(?)
             """,
@@ -311,6 +324,13 @@ def episode_keyboard(code, numbers):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def episode_done_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tayyor", callback_data="ep:done"),
+        InlineKeyboardButton(text="❌ Bekor", callback_data="ep:cancel"),
+    ]])
+
+
 # =====================================
 # ANIME QIDIRISH
 # =====================================
@@ -344,17 +364,19 @@ async def show_anime(message, code):
     if anime[2]:
         text += f"\n📝 {escape(anime[2])}\n"
 
-    if not numbers:
+    if numbers:
+        text += "\n📺 Kerakli qismni tanlang:"
+        kb = episode_keyboard(code, numbers)
+    else:
         text += "\nHozircha qismlar mavjud emas."
-        await message.answer(text)
-        return
+        kb = None
 
-    text += "\n📺 Kerakli qismni tanlang:"
-
-    await message.answer(
-        text,
-        reply_markup=episode_keyboard(code, numbers),
-    )
+    if anime[3]:
+        await message.answer_photo(
+            anime[3], caption=text[:1024], reply_markup=kb
+        )
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 # =====================================
@@ -500,6 +522,7 @@ async def subscription_check(callback: CallbackQuery, bot: Bot):
             await show_anime(
                 callback.message, anime_match.group(1)
             )
+            await callback.answer()
         else:
             await callback.answer()
     else:
@@ -581,11 +604,12 @@ async def get_episode_callback(callback: CallbackQuery, bot: Bot):
 # =====================================
 
 @dp.message(Command("admin"))
-async def admin_handler(message: Message):
+async def admin_handler(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Sizda admin huquqi yo‘q.")
         return
 
+    await state.clear()
     await message.answer(
         "🛠 <b>AniJon admin paneli</b>",
         reply_markup=admin_keyboard(),
@@ -593,7 +617,7 @@ async def admin_handler(message: Message):
 
 
 # =====================================
-# ANIME QO‘SHISH
+# ANIME QO‘SHISH: kod -> nom -> rasm -> tavsif
 # =====================================
 
 @dp.callback_query(F.data == "admin:addanime")
@@ -602,62 +626,104 @@ async def admin_add_anime(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ruxsat yo‘q.", show_alert=True)
         return
 
-    await state.set_state(AddAnime.waiting_data)
-
+    await state.clear()
+    await state.set_state(AddAnime.code)
     await callback.message.answer(
-        "Anime ma’lumotini yuboring:\n\n"
-        "<code>KOD | Anime nomi | Tavsif</code>\n\n"
-        "Masalan:\n"
-        "<code>AN001 | Naruto | Ninja haqidagi anime</code>"
+        "1/4 🔑 Anime kodini yuboring.\nMasalan: <code>AN001</code>"
     )
-
     await callback.answer()
 
 
-@dp.message(AddAnime.waiting_data)
-async def save_anime(message: Message, state: FSMContext):
+@dp.message(AddAnime.code)
+async def add_anime_code(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-
-    if not message.text or "|" not in message.text:
-        await message.answer(
-            "Format xato. KOD | Anime nomi | Tavsif"
-        )
+    code = normalize_code(message.text or "")
+    if not valid_code(code):
+        await message.answer("❌ Kod noto‘g‘ri. Faqat harf, raqam, _ va -.")
         return
+    await state.update_data(code=code)
+    await state.set_state(AddAnime.title)
+    await message.answer("2/4 📝 Anime nomini yuboring.")
 
-    parts = [x.strip() for x in message.text.split("|", 2)]
 
-    code = normalize_code(parts[0])
-    title = parts[1] if len(parts) > 1 else ""
-    description = parts[2] if len(parts) > 2 else ""
-
-    if not valid_code(code) or not title:
-        await message.answer("Kod yoki anime nomi noto‘g‘ri.")
+@dp.message(AddAnime.title)
+async def add_anime_title(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         return
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("❌ Nomni matn ko‘rinishida yuboring.")
+        return
+    await state.update_data(title=title)
+    await state.set_state(AddAnime.photo)
+    await message.answer(
+        "3/4 🖼 Anime rasmini yuboring.\nO‘tkazib yuborish: /skip"
+    )
+
+
+async def ask_description(message: Message, state: FSMContext, photo_id: str):
+    await state.update_data(photo_id=photo_id)
+    await state.set_state(AddAnime.description)
+    await message.answer(
+        "4/4 📖 Tavsifni yuboring.\nO‘tkazib yuborish: /skip"
+    )
+
+
+@dp.message(AddAnime.photo, F.photo)
+async def add_anime_photo(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await ask_description(message, state, message.photo[-1].file_id)
+
+
+@dp.message(AddAnime.photo, Command("skip"))
+async def add_anime_photo_skip(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await ask_description(message, state, "")
+
+
+@dp.message(AddAnime.photo)
+async def add_anime_photo_wrong(message: Message):
+    await message.answer("Iltimos, rasm yuboring yoki /skip bosing.")
+
+
+@dp.message(AddAnime.description)
+async def add_anime_description(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    description = "" if text == "/skip" else text
+
+    data = await state.get_data()
+    code, title = data["code"], data["title"]
+    photo_id = data.get("photo_id", "")
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO anime(code, title, description)
-            VALUES(?, ?, ?)
+            INSERT INTO anime(code, title, description, photo_id)
+            VALUES(?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 title=excluded.title,
-                description=excluded.description
+                description=excluded.description,
+                photo_id=excluded.photo_id
             """,
-            (code, title, description),
+            (code, title, description, photo_id),
         )
         await db.commit()
 
     await state.clear()
-
     await message.answer(
-        f"✅ <b>{escape(title)}</b> bazaga qo‘shildi.\n"
-        f"Anime kodi: <code>{code}</code>"
+        f"✅ <b>{escape(title)}</b> qo‘shildi.\n"
+        f"Kodi: <code>{code}</code>\n\n"
+        "Endi «🎬 Qism qo‘shish» orqali qismlarni yuklang."
     )
 
 
 # =====================================
-# QISM QO‘SHISH
+# QISM QO‘SHISH: ketma-ket, avtomatik raqamlash
 # =====================================
 
 @dp.callback_query(F.data == "admin:addepisode")
@@ -666,124 +732,15 @@ async def admin_add_episode(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ruxsat yo‘q.", show_alert=True)
         return
 
-    await state.set_state(AddEpisode.waiting_data)
-
+    await state.clear()
+    await state.set_state(AddEpisode.waiting_code)
     await callback.message.answer(
-        "Anime kodi va qism raqamini yuboring:\n\n"
-        "<code>KOD | QISM</code>\n"
-        "Masalan: <code>AN001 | 1</code>"
+        "🔑 Anime kodini yuboring.\n"
+        "Masalan: <code>AN001</code>\n\n"
+        "Aniq raqamdan boshlash uchun: <code>AN001 | 5</code>"
     )
-
     await callback.answer()
 
 
-@dp.message(AddEpisode.waiting_data)
-async def episode_metadata(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-
-    if not message.text or "|" not in message.text:
-        await message.answer("Format: <code>AN001 | 1</code>")
-        return
-
-    code, number_text = [
-        x.strip() for x in message.text.split("|", 1)
-    ]
-
-    code = normalize_code(code)
-
-    if not valid_code(code) or not number_text.isdigit():
-        await message.answer("Anime kodi yoki qism raqami noto‘g‘ri.")
-        return
-
-    number = int(number_text)
-
-    if number < 1:
-        await message.answer("Qism raqami 1 yoki undan katta bo‘lishi kerak.")
-        return
-
-    anime = await get_anime(code)
-
-    if not anime:
-        await message.answer("Anime topilmadi. Avval anime qo‘shing.")
-        return
-
-    await state.update_data(
-        code=code,
-        episode_no=number,
-    )
-
-    await state.set_state(AddEpisode.waiting_video)
-
-    await message.answer(
-        f"🎬 <b>{escape(anime[1])}</b> — {number}-qism.\n\n"
-        "Endi video yoki video faylni yuboring.\n"
-        "Bot uni Ombor kanaliga saqlaydi."
-    )
-
-
-@dp.message(AddEpisode.waiting_video, F.video | F.document)
-async def save_episode_file(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id):
-        return
-
-    data = await state.get_data()
-
-    code = data["code"]
-    number = data["episode_no"]
-    anime = await get_anime(code)
-
-    if not anime:
-        await message.answer("Anime topilmadi. Jarayonni qaytadan boshlang.")
-        await state.clear()
-        return
-
-    try:
-        storage_caption = (
-            f"{anime[1]} — {number}-qism | {code}"
-        )
-
-        if message.video:
-            stored = await bot.send_video(
-                STORAGE_CHANNEL_ID,
-                message.video.file_id,
-                caption=storage_caption,
-            )
-
-            file_id = stored.video.file_id
-            file_type = "video"
-
-        else:
-            stored = await bot.send_document(
-                STORAGE_CHANNEL_ID,
-                message.document.file_id,
-                caption=storage_caption,
-            )
-
-            file_id = stored.document.file_id
-            file_type = "document"
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                """
-                INSERT INTO episodes(
-                    anime_code, episode_no, file_id, file_type, caption
-                )
-                                VALUES(?, ?, ?, ?, ?)
-                """,
-                (code, number, file_id, file_type, storage_caption),
-            )
-
-            await db.commit()
-
-        await message.answer(
-            f"✅ {anime[1]} — {number}-qism muvaffaqiyatli saqlandi!"
-        )
-
-        await state.clear()
-
-    except Exception as e:
-        logging.exception("Qismni saqlashda xatolik")
-        await message.answer(
-            f"❌ Xatolik yuz berdi: {e}"
-        )
+@dp.message(AddEpisode.waiting_code)
+async def episode_
