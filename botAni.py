@@ -744,3 +744,336 @@ async def admin_add_episode(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AddEpisode.waiting_code)
 async def episode_
+@dp.message(AddEpisode.waiting_code)
+async def episode_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = [x.strip() for x in (message.text or "").split("|", 1)]
+    code = normalize_code(parts[0])
+
+    if not valid_code(code):
+        await message.answer("❌ Kod noto‘g‘ri.")
+        return
+
+    anime = await get_anime(code)
+    if not anime:
+        await message.answer("❌ Anime topilmadi. Avval anime qo‘shing.")
+        return
+
+    if len(parts) > 1 and parts[1].isdigit() and int(parts[1]) >= 1:
+        start = int(parts[1])
+    else:
+        numbers = await get_episode_numbers(code)
+        start = (max(numbers) + 1) if numbers else 1
+
+    pending_episodes[message.from_user.id] = {
+        "code": code,
+        "start": start,
+        "items": [],
+    }
+    await state.set_state(AddEpisode.waiting_videos)
+
+    await message.answer(
+        f"🎬 <b>{escape(anime[1])}</b>\n"
+        f"{start}-qismdan boshlab videolarni ketma-ket yuboring "
+        "(masalan 24 tasini birdan tashlang).\n"
+        "Hammasini yuborib bo‘lgach «✅ Tayyor» ni bosing.",
+        reply_markup=episode_done_keyboard(),
+    )
+
+
+@dp.message(AddEpisode.waiting_videos, F.video | F.document)
+async def episode_collect(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    job = pending_episodes.get(message.from_user.id)
+    if not job:
+        await message.answer("Jarayon topilmadi. Qaytadan boshlang.")
+        return
+
+    if message.video:
+        item = (message.message_id, message.video.file_id, "video")
+    else:
+        item = (message.message_id, message.document.file_id, "document")
+
+    job["items"].append(item)
+
+    # har 5 ta faylda bir marta tasdiq
+    if len(job["items"]) % 5 == 0:
+        await message.answer(
+            f"📥 {len(job['items'])} ta fayl qabul qilindi.",
+            reply_markup=episode_done_keyboard(),
+        )
+
+
+async def send_to_storage(bot: Bot, file_id,
+ for _ in range(5):
+        try:
+            if file_type == "video":
+                stored = await bot.send_video(
+                    STORAGE_CHANNEL_ID, file_id, caption=caption
+                )
+                return stored.video.file_id, "video"
+            stored = await bot.send_document(
+                STORAGE_CHANNEL_ID, file_id, caption=caption
+            )
+            return stored.document.file_id, "document"
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
+    raise RuntimeError("Ombor kanaliga yuborib bo‘lmadi")
+
+
+async def finish_episodes(
+    target: Message, state: FSMContext, bot: Bot, user_id: int
+):
+    job = pending_episodes.pop(user_id, None)
+    await state.clear()
+
+    if not job or not job["items"]:
+        await target.answer("❌ Hech qanday fayl yuborilmadi.")
+        return
+
+    code = job["code"]
+    anime = await get_anime(code)
+    items = sorted(job["items"], key=lambda x: x[0])  # yuborilgan tartib
+
+    status = await target.answer(f"⏳ {len(items)} ta qism saqlanmoqda...")
+    saved = []
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            for i, (_, file_id, file_type) in enumerate(items):
+                number = job["start"] + i
+                caption = f"{anime[1]} — {number}-qism | {code}"
+
+                new_id, new_type = await send_to_storage(
+                    bot, file_id, file_type, caption
+                )
+
+                await db.execute(
+                    """
+                    INSERT INTO episodes(
+                        anime_code, episode_no, file_id, file_type, caption
+                    )
+                    VALUES(?, ?, ?, ?, '')
+                    ON CONFLICT(anime_code, episode_no) DO UPDATE SET
+                        file_id=excluded.file_id,
+                        file_type=excluded.file_type
+                    """,
+                    (code, number, new_id, new_type),
+                )
+                await db.commit()
+                saved.append(number)
+                await asyncio.sleep(1.2)  # Telegram limitidan qochish
+
+    except Exception as exc:
+        log.exception("Qism saqlash xatosi: %s", exc)
+        await status.edit_text(
+            f"⚠️ Xato bo‘ldi. Saqlangan qismlar: {len(saved)} ta"
+            + (f" ({saved[0]}–{saved[-1]})" if saved else "")
+        )
+        return
+
+    await status.edit_text(
+        f"✅ <b>{escape(anime[1])}</b>: {len(saved)} ta qism qo‘shildi "
+        f"({saved[0]}–{saved[-1]}-qism)."
+    )
+
+
+@dp.callback_query(F.data == "ep:done")
+async def episode_done_cb(
+    callback: CallbackQuery, state: FSMContext, bot: Bot
+):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+    await callback.answer()
+    await finish_episodes(
+        callback.message, state, bot, callback.from_user.id
+    )
+
+
+@dp.message(Command("done"))
+async def episode_done_cmd(
+    message: Message, state: FSMContext, bot: Bot
+):
+    if is_admin(message.from_user.id):
+        await finish_episodes(message, state, bot, message.from_user.id)
+
+
+@dp.callback_query(F.data == "ep:cancel")
+async def episode_cancel(callback: CallbackQuery, state: FSMContext):
+    pending_episodes.pop(callback.from_user.id, None)
+    await state.clear()
+    await callback.message.answer("❌ Bekor qilindi.")
+    await callback.answer()
+
+
+# =====================================
+# ANIME RO‘YXATI
+# =====================================
+
+@dp.callback_query(F.data == "admin:list")
+async def admin_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT a.code, a.title, COUNT(e.episode_no)
+            FROM anime a
+            LEFT JOIN episodes e ON e.anime_code = a.code
+            GROUP BY a.code
+            ORDER BY a.code
+            """
+        )
+        rows = await cur.fetchall()
+
+    if not rows:
+        await callback.message.answer("📚 Hozircha anime yo‘q.")
+        await callback.answer()
+        return
+
+    lines = [
+        f"<code>{escape(code)}</code> — {escape(title)} ({count} qism)"
+        for code, title, count in rows
+    ]
+
+    text = "📚 <b>Anime ro‘yxati</b>\n\n"
+    for line in lines:
+        if len(text) + len(line) > 3800:
+            await callback.message.answer(text)
+            text = ""
+        text += line + "\n"
+
+    if text:
+        await callback.message.answer(text)
+
+    await callback.answer()
+
+
+# =====================================
+# STATISTIKA
+# =====================================
+
+@dp.callback_query(F.data == "admin:stats")
+async def admin_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+
+    anime_count, episode_count = await get_statistics()
+
+    await callback.message.answer(
+        "📊 <b>Statistika</b>\n\n"
+        f"🎬 Anime: <b>{anime_count}</b>\n"
+        f"📺 Qismlar: <b>{episode_count}</b>"
+    )
+    await callback.answer()
+
+
+# =====================================
+# KANALGA CHIQARISH
+# =====================================
+
+@dp.callback_query(F.data == "admin:publish")
+async def admin_publish(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(PublishAnime.waiting_code)
+    await callback.message.answer(
+        "📣 Kanalga chiqariladigan anime kodini yuboring.\n"
+        "Masalan: <code>AN001</code>"
+    )
+    await callback.answer()
+
+
+@dp.message(PublishAnime.waiting_code)
+async def publish_anime(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return
+
+    code = normalize_code(message.text or "")
+
+    if not valid_code(code):
+        await message.answer("❌ Kod noto‘g‘ri.")
+        return
+
+    anime = await get_anime(code)
+
+    if not anime:
+        await message.answer("❌ Anime topilmadi.")
+        return
+
+    numbers = await get_episode_numbers(code)
+
+    text = f"🎬 <b>{escape(anime[1])}</b>\n\n"
+
+    if anime[2]:
+        text += f"📝 {escape(anime[2])}\n\n"
+
+    text += f"📺 Qismlar soni: <b>{len(numbers)}</b>"
+
+    try:
+        me = await bot.get_me()
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="▶️ Ko‘rish",
+                url=f"https://t.me/{me.username}?start=anime_{code}",
+            )
+        ]])
+
+        if anime[3]:
+            await bot.send_photo(
+                PUBLIC_CHANNEL_ID,
+                anime[3],
+                caption=text[:1024],
+                reply_markup=kb,
+            )
+        else:
+            await bot.send_message(
+                PUBLIC_CHANNEL_ID, text, reply_markup=kb
+            )
+
+    except TelegramAPIError as exc:
+        log.exception("Kanalga chiqarishda xato: %s", exc)
+        await message.answer(
+            "❌ Kanalga yuborib bo‘lmadi. "
+            "Bot kanalda admin ekanini tekshiring."
+        )
+        return
+
+    await state.clear()
+    await message.answer("✅ Anime kanalga chiqarildi.")
+
+
+# =====================================
+# ISHGA TUSHIRISH
+# =====================================
+
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN topilmadi. Railway Variables ga qo‘shing.")
+
+    await init_db()
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    log.info("AniJon bot ishga tushdi")
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
