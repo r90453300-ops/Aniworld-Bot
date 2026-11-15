@@ -743,8 +743,6 @@ async def admin_add_episode(callback: CallbackQuery, state: FSMContext):
 
 
 @dp.message(AddEpisode.waiting_code)
-async def episode_
-@dp.message(AddEpisode.waiting_code)
 async def episode_code(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
