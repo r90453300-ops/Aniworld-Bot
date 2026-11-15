@@ -769,4 +769,21 @@ async def save_episode_file(message: Message, state: FSMContext, bot: Bot):
                 INSERT INTO episodes(
                     anime_code, episode_no, file_id, file_type, caption
                 )
-                VALUES(?, ?, ?, ?, ?)
+                                VALUES(?, ?, ?, ?, ?)
+                """,
+                (code, number, file_id, file_type, storage_caption),
+            )
+
+            await db.commit()
+
+        await message.answer(
+            f"✅ {anime[1]} — {number}-qism muvaffaqiyatli saqlandi!"
+        )
+
+        await state.clear()
+
+    except Exception as e:
+        logging.exception("Qismni saqlashda xatolik")
+        await message.answer(
+            f"❌ Xatolik yuz berdi: {e}"
+        )
