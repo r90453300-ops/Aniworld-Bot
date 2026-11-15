@@ -806,8 +806,8 @@ async def episode_collect(message: Message):
         )
 
 
-async def send_to_storage(bot: Bot, file_id,
- for _ in range(5):
+async def send_to_storage(bot: Bot, file_id, file_type, caption):
+    for _ in range(5):
         try:
             if file_type == "video":
                 stored = await bot.send_video(
@@ -907,8 +907,6 @@ async def episode_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.answer("❌ Bekor qilindi.")
     await callback.answer()
-
-
 # =====================================
 # ANIME RO‘YXATI
 # =====================================
