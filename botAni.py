@@ -35,6 +35,7 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 DB_PATH = os.getenv("DB_PATH", "anijon.db")
+SITE_URL = os.getenv("SITE_URL", "https://anijonbot.netlify.app").strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,6 +137,12 @@ def subscription_keyboard(payload: str = "") -> InlineKeyboardMarkup:
     ])
 
 
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Anime saytiga kirish", url=SITE_URL)],
+    ])
+
+
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Anime qo‘shish", callback_data="admin:addanime")],
@@ -223,7 +230,9 @@ async def start_handler(message: Message, bot: Bot):
     await message.answer(
         "👋 <b>AniWorldDub botiga xush kelibsiz!</b>\n\n"
         "Anime qismini olish uchun saytdagi qism tugmasini bosing "
-        "yoki anime havolasi orqali kiring."
+        "yoki anime havolasi orqali kiring.\n\n"
+        "Saytimizdan anime qidirishingiz mumkin:",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -257,7 +266,11 @@ async def subscription_check(callback: CallbackQuery, bot: Bot):
             else:
                 await callback.message.answer("Bu anime kodi topilmadi.")
     else:
-        await callback.message.answer("Endi botdan foydalanishingiz mumkin.")
+        await callback.message.answer(
+            "✅ Endi botdan foydalanishingiz mumkin.\n\n"
+            "Anime qidirish uchun saytimizga kiring:",
+            reply_markup=main_keyboard(),
+        )
 
 
 @dp.callback_query(F.data.startswith("get:"))
