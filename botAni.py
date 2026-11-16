@@ -798,12 +798,11 @@ async def episode_collect(message: Message):
 
     job["items"].append(item)
 
-    # har 5 ta faylda bir marta tasdiq
-    if len(job["items"]) % 5 == 0:
-        await message.answer(
-            f"📥 {len(job['items'])} ta fayl qabul qilindi.",
-            reply_markup=episode_done_keyboard(),
-        )
+        n = len(job["items"])
+    await message.answer(
+        f"📥 {n}-fayl qabul qilindi.",
+        reply_markup=episode_done_keyboard() if n % 5 == 0 else None,
+    )
 
 
 async def send_to_storage(bot: Bot, file_id, file_type, caption):
