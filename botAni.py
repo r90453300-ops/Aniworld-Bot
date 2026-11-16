@@ -783,9 +783,7 @@ async def episode_code(message: Message, state: FSMContext):
 
 @dp.message(AddEpisode.waiting_videos, F.video | F.document)
 async def episode_collect(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
+    if not is_admin(message.from_user.id): return
     job = pending_episodes.get(message.from_user.id)
     if not job:
         await message.answer("Jarayon topilmadi. Qaytadan boshlang.")
