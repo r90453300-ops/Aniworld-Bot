@@ -614,8 +614,6 @@ async def admin_handler(message: Message, state: FSMContext):
         "🛠 <b>AniJon admin paneli</b>",
         reply_markup=admin_keyboard(),
     )
-
-
 # =====================================
 # ANIME QO‘SHISH: kod -> nom -> rasm -> tavsif
 # =====================================
@@ -783,26 +781,23 @@ async def episode_code(message: Message, state: FSMContext):
 
 @dp.message(AddEpisode.waiting_videos, F.video | F.document)
 async def episode_collect(message: Message):
-    if not is_admin(message.from_user.id): return
+    if not is_admin(message.from_user.id):
+        return
+
     job = pending_episodes.get(message.from_user.id)
     if not job:
         await message.answer("Jarayon topilmadi. Qaytadan boshlang.")
         return
 
-        if message.video:
-        item = (message.message_id, message.video.file_id, "video")
-    else:
-        item = (message.message_id, message.document.file_id, "document")
-
-    job["items"].append(item)
+    media = message.video or message.document
+    kind = "video" if message.video else "document"
+    job["items"].append((message.message_id, media.file_id, kind))
 
     n = len(job["items"])
     await message.answer(
         f"📥 {n}-fayl qabul qilindi.",
         reply_markup=episode_done_keyboard() if n % 5 == 0 else None,
     )
-
-
 async def send_to_storage(bot: Bot, file_id, file_type, caption):
     for _ in range(5):
         try:
