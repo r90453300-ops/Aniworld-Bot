@@ -791,14 +791,14 @@ async def episode_collect(message: Message):
         await message.answer("Jarayon topilmadi. Qaytadan boshlang.")
         return
 
-    if message.video:
+        if message.video:
         item = (message.message_id, message.video.file_id, "video")
     else:
         item = (message.message_id, message.document.file_id, "document")
 
     job["items"].append(item)
 
-        n = len(job["items"])
+    n = len(job["items"])
     await message.answer(
         f"📥 {n}-fayl qabul qilindi.",
         reply_markup=episode_done_keyboard() if n % 5 == 0 else None,
